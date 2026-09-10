@@ -1,0 +1,7 @@
+# Tema visual do app, usando a paleta da marca BioCAZ.
+[theme]
+primaryColor = "#43AA8A"          # verde BioCAZ - botões, seleções, destaques
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1F5F3"
+textColor = "#000000"
+linkColor = "#0C1B7D"             # azul-marinho BioCAZ - links

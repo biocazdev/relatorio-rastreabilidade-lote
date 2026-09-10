@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.env
+*.xlsx
+.DS_Store
+
+# artefatos de build do empacotamento (gerados por build_exe.bat / installer.iss)
+build/
+dist/
+instalador/
+app.py.bak_pre_empacotamento
+conn.enc
+*.spec

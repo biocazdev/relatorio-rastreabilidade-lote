@@ -1,0 +1,10 @@
+streamlit>=1.37
+pandas>=2.2,<3.0
+SQLAlchemy>=2.0
+pyodbc>=5.1
+XlsxWriter>=3.2
+python-dotenv>=1.0
+altair>=5.0
+reportlab>=4.0
+cryptography>=42
+pywebview>=5,<6
