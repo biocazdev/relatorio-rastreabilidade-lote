@@ -1,7 +1,0 @@
-# Vazio de proposito: o app agora usa pymssql (FreeTDS embutido na
-# própria wheel Python) no Streamlit Community Cloud, em vez de
-# unixODBC/FreeTDS via apt. Motivo: os pacotes acima davam conflito de
-# dpkg no Cloud ("trying to overwrite libodbc.so.2.0.0..."), porque o
-# libodbc1 da Microsoft já vem instalado na imagem base e colide com o
-# libodbc2 do Debian trixie. Ver README.md, secao "Publicando no
-# Streamlit Community Cloud".
