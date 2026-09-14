@@ -310,6 +310,28 @@ def get_engine() -> Engine:
     driver = cfg.get("driver") or "ODBC Driver 18 for SQL Server"
     odbc_extra = cfg.get("odbc_extra") or "TrustServerCertificate=yes;Encrypt=yes"
 
+    if driver.strip().lower() == "pymssql":
+        # Rota sem ODBC nenhum - usada no Streamlit Community Cloud. O
+        # pymssql traz o FreeTDS embutido no proprio pacote Python (wheel
+        # pre-compilada), sem precisar instalar nada via apt/packages.txt -
+        # e foi pra essa rota que trocamos depois que o packages.txt com
+        # unixodbc/freetds passou a dar conflito de pacote no Cloud
+        # ("trying to overwrite libodbc.so.2.0.0..."). Local (Windows), o
+        # driver ODBC da Microsoft continua sendo o caminho recomendado
+        # (mais testado) - so troque para "pymssql" no secrets.toml do
+        # Cloud, sem precisar mudar o .env local.
+        url = URL.create(
+            "mssql+pymssql",
+            username=cfg["usuario"],
+            password=cfg["senha"],
+            host=cfg["servidor"],
+            port=int(cfg.get("porta") or 1433),
+            database=cfg["database"],
+        )
+        engine = create_engine(url, pool_pre_ping=True)
+        st.session_state["_conn_origem"] = origem
+        return engine
+
     # Monta os parametros extra (ex: "TrustServerCertificate=yes;Encrypt=yes")
     # como um dicionario, em vez de concatenar a string manualmente - isso
     # evita erros de parsing no driver ODBC e cuida de caracteres especiais

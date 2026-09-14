@@ -166,22 +166,22 @@ filtros e clique em "Executar consulta".
 
 - **Localmente / servidor Windows da empresa**: normalmente já existe o
   "ODBC Driver 17" ou "18 for SQL Server" da Microsoft instalado. Use esse
-  nome no campo `driver` do `secrets.toml`.
-- **Streamlit Community Cloud (Linux)**: o driver ODBC da Microsoft **não**
-  vem instalado e não pode ser adicionado via `packages.txt` (exigiria
-  configurar o repositório da Microsoft, que o Cloud não permite rodar).
-  Este projeto já inclui um `packages.txt` com o driver **FreeTDS**, que
-  funciona nativamente no Cloud. Nesse caso, no secrets do Cloud, use:
+  nome no campo `driver` do `secrets.toml`/`.env` — é o caminho mais
+  testado, mantenha assim no Windows.
+- **Streamlit Community Cloud (Linux)**: o app usa **`pymssql`** nesse
+  ambiente, em vez de ODBC. É só colocar `driver = "pymssql"` no secrets do
+  Cloud (ver seção 3) — o `get_engine()` detecta esse valor e monta a
+  conexão sem depender de ODBC/FreeTDS instalado via `packages.txt`.
 
-  ```toml
-  driver     = "FreeTDS"
-  odbc_extra = "TDS_Version=7.4;"
-  ```
-
-  Se preferir não lidar com ODBC no Cloud, a alternativa mais simples é
-  trocar `pyodbc` por `pymssql` (`pip install pymssql`, sem dependência de
-  driver do sistema) e ajustar a string de conexão em `get_engine()` para
-  `mssql+pymssql://usuario:senha@servidor:porta/database`.
+  > **Por que não FreeTDS/unixODBC via `packages.txt` (como este projeto
+  > tentou antes)**: a imagem base do Streamlit Cloud já vem com o
+  > `libodbc1` da Microsoft pré-instalado, e o pacote `unixodbc-dev` do
+  > Debian trixie tenta sobrescrever o mesmo arquivo (`libodbc.so.2.0.0`)
+  > com o `libodbc2` dele — o `apt-get` quebra com "trying to overwrite
+  > .../libodbc.so.2.0.0, which is also in package libodbc2" e o deploy
+  > fica em loop de erro. O `pymssql` evita esse problema inteiro: ele traz
+  > o FreeTDS embutido na própria wheel Python, sem nenhum pacote de
+  > sistema. Por isso o `packages.txt` deste projeto está vazio hoje.
 
 ## 3. Publicando no Streamlit Community Cloud
 
@@ -190,7 +190,9 @@ filtros e clique em "Executar consulta".
 2. Em [share.streamlit.io](https://share.streamlit.io), clique em
    "New app", selecione o repositório, branch e o arquivo `app.py`.
 3. Em **Settings → Secrets**, cole o conteúdo do seu `secrets.toml` real
-   (com os dados de conexão verdadeiros).
+   (com os dados de conexão verdadeiros), usando `driver = "pymssql"` (ver
+   seção 2 acima) — exemplo completo em
+   `.streamlit/secrets.toml.example`.
 4. Deploy.
 
 ### ⚠️ Importante: o banco precisa ser alcançável pela internet
