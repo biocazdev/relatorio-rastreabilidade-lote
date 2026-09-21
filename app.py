@@ -913,10 +913,17 @@ def carregar_armazens(_engine: Engine, filial: str) -> pd.DataFrame:
 # D1_CUSTO (que already vem liquido de ICMS/impostos recuperaveis) ao saldo
 # em valor e recalcula a media; a cada saida, valoriza pela media vigente
 # no momento e desconta do saldo.
-KARDEX_QUERY = """
+#
+# O produto e OPCIONAL (diferente da aba Saldo em Estoque): se nao
+# informado, traz o Kardex de TODOS os produtos daquele armazem - por isso
+# a query tem PRODUTO/DESCRICAO nas colunas, e monta_query_kardex() so
+# adiciona a clausula "AND ...COD = :produto" (nas duas metades do UNION)
+# quando o usuario de fato digitou/escolheu um produto.
+KARDEX_QUERY_BASE = """
 WITH MOVIMENTOS_KARDEX AS (
     SELECT
         'ENTRADA'                  AS TIPO_MOV,
+        D1.D1_COD                  AS PRODUTO,
         D1.D1_EMISSAO              AS DATA_MOV,
         RTRIM(D1.D1_TES)           AS TES,
         RTRIM(D1.D1_CF)            AS CFO,
@@ -931,13 +938,14 @@ WITH MOVIMENTOS_KARDEX AS (
 
     WHERE D1.D_E_L_E_T_ = ' '
       AND D1.D1_FILIAL = :filial
-      AND D1.D1_COD    = :produto
       AND D1.D1_LOCAL  = :local
+      {filtro_produto_d1}
 
     UNION ALL
 
     SELECT
         'SAIDA'                    AS TIPO_MOV,
+        D2.D2_COD                  AS PRODUTO,
         D2.D2_EMISSAO              AS DATA_MOV,
         RTRIM(D2.D2_TES)           AS TES,
         RTRIM(D2.D2_CF)            AS CFO,
@@ -952,46 +960,55 @@ WITH MOVIMENTOS_KARDEX AS (
 
     WHERE D2.D_E_L_E_T_ = ' '
       AND D2.D2_FILIAL = :filial
-      AND D2.D2_COD    = :produto
       AND D2.D2_LOCAL  = :local
+      {filtro_produto_d2}
 )
-SELECT TIPO_MOV, DATA_MOV, TES, CFO, DOC, SERIE, ITEM, QUANTIDADE, CUSTO_TOTAL_ENTRADA, RECNO
-FROM MOVIMENTOS_KARDEX
-ORDER BY DATA_MOV, DOC, SERIE, ITEM
+SELECT
+    M.TIPO_MOV, M.PRODUTO, RTRIM(PROD.B1_DESC) AS DESCRICAO, M.DATA_MOV, M.TES, M.CFO, M.DOC, M.SERIE,
+    M.ITEM, M.QUANTIDADE, M.CUSTO_TOTAL_ENTRADA, M.RECNO
+FROM MOVIMENTOS_KARDEX M
+LEFT JOIN SB1010 PROD
+       ON PROD.B1_FILIAL = LEFT(:filial, 4)
+      AND PROD.B1_COD    = M.PRODUTO
+      AND PROD.D_E_L_E_T_ = ' '
+ORDER BY M.PRODUTO, M.DATA_MOV, M.DOC, M.SERIE, M.ITEM
 """
 
 
+def montar_query_kardex(produto: str) -> tuple[str, dict]:
+    """Monta a KARDEX_QUERY_BASE substituindo {filtro_produto_d1}/{filtro_produto_d2}
+    - so adiciona o filtro de produto (nas duas metades do UNION) quando o
+    usuario de fato informou um produto; sem produto, traz todos."""
+    params = {}
+    if produto and produto.strip():
+        filtro_d1 = "AND D1.D1_COD = :produto"
+        filtro_d2 = "AND D2.D2_COD = :produto"
+        params["produto"] = produto.strip()
+    else:
+        filtro_d1 = filtro_d2 = ""
+    sql = KARDEX_QUERY_BASE.format(filtro_produto_d1=filtro_d1, filtro_produto_d2=filtro_d2)
+    return sql, params
+
+
 @st.cache_data(ttl=300, show_spinner="Consultando movimentos do Kardex...")
-def carregar_kardex_bruto(_engine: Engine, filial: str, produto: str, local: str) -> tuple[pd.DataFrame, datetime]:
+def carregar_kardex_bruto(_engine: Engine, filial: str, local: str, produto: str = "") -> tuple[pd.DataFrame, datetime]:
     """Devolve (DataFrame, horário da consulta) so com os movimentos brutos
     (sem saldo/custo calculado ainda - isso e feito por calcular_kardex(),
     fora do cache, porque e so processamento em memoria e nao precisa
-    bater no banco de novo)."""
+    bater no banco de novo). `produto` vazio = todos os produtos daquele
+    armazem (ver montar_query_kardex)."""
+    sql, params_produto = montar_query_kardex(produto)
+    params = {"filial": filial, "local": local.strip(), **params_produto}
     with _engine.connect() as conn:
-        df = pd.read_sql(
-            text(KARDEX_QUERY),
-            conn,
-            params={"filial": filial, "produto": produto.strip(), "local": local.strip()},
-        )
+        df = pd.read_sql(text(sql), conn, params=params)
     return df, datetime.now()
 
 
-def calcular_kardex(df_bruto: pd.DataFrame) -> pd.DataFrame:
-    """Recebe os movimentos brutos (ja ordenados por DATA_MOV/DOC/SERIE/ITEM)
-    e calcula, linha a linha, o custo do movimento e o saldo corrente
-    (quantidade e valor), pelo metodo de custo medio ponderado movel -
-    mesma logica que o Protheus usa internamente:
-
-    - ENTRADA: soma a quantidade e o custo total (D1_CUSTO) ao saldo;
-      o "custo unitario" dessa entrada e custo_total / quantidade.
-    - SAIDA: valoriza a quantidade que sai pela media vigente NESSE
-      momento (saldo_valor / saldo_qtd), e desconta quantidade e valor
-      do saldo.
-
-    Saldo inicial e sempre 0 - a consulta traz o historico completo (sem
-    filtro de periodo), entao nao ha saldo "anterior" a considerar.
-    """
-    df = df_bruto.copy()
+def _calcular_kardex_de_um_produto(df_produto: pd.DataFrame) -> pd.DataFrame:
+    """Aplica o calculo de custo medio ponderado movel (ver docstring de
+    calcular_kardex) num DataFrame que ja e de UM produto so, na ordem
+    cronologica certa. Saldo inicial e sempre 0."""
+    df = df_produto.copy()
     saldo_qtd = 0.0
     saldo_valor = 0.0
 
@@ -1030,6 +1047,35 @@ def calcular_kardex(df_bruto: pd.DataFrame) -> pd.DataFrame:
     df["SALDO_VALOR"] = saldo_valor_lista
     df["CUSTO_MEDIO"] = custo_medio_lista
     return df
+
+
+def calcular_kardex(df_bruto: pd.DataFrame) -> pd.DataFrame:
+    """Recebe os movimentos brutos (ja ordenados por PRODUTO/DATA_MOV/DOC/
+    SERIE/ITEM) e calcula, linha a linha, o custo do movimento e o saldo
+    corrente (quantidade e valor), pelo metodo de custo medio ponderado
+    movel - mesma logica que o Protheus usa internamente:
+
+    - ENTRADA: soma a quantidade e o custo total (D1_CUSTO) ao saldo;
+      o "custo unitario" dessa entrada e custo_total / quantidade.
+    - SAIDA: valoriza a quantidade que sai pela media vigente NESSE
+      momento (saldo_valor / saldo_qtd), e desconta quantidade e valor
+      do saldo.
+
+    Quando a consulta traz mais de um produto (produto nao informado no
+    filtro), o calculo e feito SEPARADO por produto (agrupando por
+    PRODUTO) - senao o saldo de um produto se misturaria com o de outro.
+    Saldo inicial de cada produto e sempre 0 - a consulta traz o historico
+    completo (sem filtro de periodo), entao nao ha saldo "anterior" a
+    considerar.
+    """
+    if df_bruto.empty:
+        return df_bruto
+
+    partes = [
+        _calcular_kardex_de_um_produto(grupo)
+        for _, grupo in df_bruto.groupby("PRODUTO", sort=False)
+    ]
+    return pd.concat(partes, ignore_index=True)
 
 
 # --------------------------------------------------------------------------
@@ -2888,13 +2934,15 @@ with aba_estoque:
 # banco).
 with aba_kardex:
     st.caption(
-        "Histórico cronológico de entradas e saídas de um produto, num armazém específico, com saldo e "
-        "custo médio correntes após cada movimento — no mesmo espírito da tela nativa de Kardex."
+        "Histórico cronológico de entradas e saídas num armazém específico, com saldo e custo médio "
+        "correntes após cada movimento — no mesmo espírito da tela nativa de Kardex. Produto é opcional: "
+        "sem informar, traz todos os produtos com movimento naquele armazém (cada um com seu próprio "
+        "saldo/custo, calculados separadamente)."
     )
 
     col_k1, col_k2, col_k3 = st.columns([3, 2, 1])
     produto_kardex = seletor_produto(
-        engine, "kardex", container=col_k1, label_codigo="Produto (código exato)"
+        engine, "kardex", container=col_k1, label_codigo="Produto (código exato, opcional)"
     )
 
     try:
@@ -2913,14 +2961,12 @@ with aba_kardex:
     consultar_kardex = col_k3.button("Consultar", type="primary", key="btn_kardex")
 
     if consultar_kardex:
-        if not produto_kardex.strip():
-            st.warning("Informe o código do produto para consultar.")
-        elif not armazem_codigo:
+        if not armazem_codigo:
             st.warning("Selecione o armazém para consultar.")
         else:
             try:
                 st.session_state["df_kardex"], st.session_state["df_kardex_timestamp"] = carregar_kardex_bruto(
-                    engine, filial, produto_kardex, armazem_codigo
+                    engine, filial, armazem_codigo, produto_kardex
                 )
                 st.session_state["produto_kardex_atual"] = produto_kardex.strip()
                 st.session_state["armazem_kardex_atual"] = armazem_escolha
@@ -2932,12 +2978,12 @@ with aba_kardex:
     df_kardex_bruto = st.session_state.get("df_kardex")
 
     if df_kardex_bruto is None:
-        st.info("Informe o produto e o armazém e clique em 'Consultar'.")
+        st.info("Selecione o armazém (produto é opcional) e clique em 'Consultar'.")
     elif df_kardex_bruto.empty:
+        _produto_msg = st.session_state.get("produto_kardex_atual", "")
         st.info(
-            "Nenhuma entrada ou saída encontrada para o produto "
-            f"'{st.session_state.get('produto_kardex_atual', '')}' no armazém "
-            f"'{st.session_state.get('armazem_kardex_atual', '')}'."
+            ("Nenhuma entrada ou saída encontrada" + (f" para o produto '{_produto_msg}'" if _produto_msg else ""))
+            + f" no armazém '{st.session_state.get('armazem_kardex_atual', '')}'."
         )
     else:
         _ts_k = st.session_state.get("df_kardex_timestamp")
@@ -2948,27 +2994,42 @@ with aba_kardex:
             )
 
         df_k = calcular_kardex(df_kardex_bruto)
+        produtos_encontrados = df_k["PRODUTO"].unique().tolist()
+        um_produto_so = len(produtos_encontrados) == 1
 
-        st.subheader(
-            f"{st.session_state.get('produto_kardex_atual', '')} — "
-            f"Armazém {st.session_state.get('armazem_kardex_atual', '')}"
-        )
+        if um_produto_so:
+            desc_produto = df_k["DESCRICAO"].iloc[0] or ""
+            st.subheader(
+                f"{produtos_encontrados[0]} — {desc_produto} — "
+                f"Armazém {st.session_state.get('armazem_kardex_atual', '')}"
+            )
 
-        total_entradas_qtd = df_k.loc[df_k["TIPO_MOV"] == "ENTRADA", "QUANTIDADE"].sum()
-        total_saidas_qtd = df_k.loc[df_k["TIPO_MOV"] == "SAIDA", "QUANTIDADE"].sum()
-        saldo_final_qtd = df_k["SALDO_QTD"].iloc[-1]
-        saldo_final_valor = df_k["SALDO_VALOR"].iloc[-1]
-        custo_medio_atual = df_k["CUSTO_MEDIO"].iloc[-1]
+            total_entradas_qtd = df_k.loc[df_k["TIPO_MOV"] == "ENTRADA", "QUANTIDADE"].sum()
+            total_saidas_qtd = df_k.loc[df_k["TIPO_MOV"] == "SAIDA", "QUANTIDADE"].sum()
+            saldo_final_qtd = df_k["SALDO_QTD"].iloc[-1]
+            saldo_final_valor = df_k["SALDO_VALOR"].iloc[-1]
+            custo_medio_atual = df_k["CUSTO_MEDIO"].iloc[-1]
 
-        ck1, ck2, ck3, ck4 = st.columns(4)
-        ck1.metric("Saldo inicial", "0,00")
-        ck2.metric("Total entradas", formatar_numero_br(total_entradas_qtd, 3))
-        ck3.metric("Total saídas", formatar_numero_br(total_saidas_qtd, 3))
-        ck4.metric("Saldo final", formatar_numero_br(saldo_final_qtd, 3))
+            ck1, ck2, ck3, ck4 = st.columns(4)
+            ck1.metric("Saldo inicial", "0,00")
+            ck2.metric("Total entradas", formatar_numero_br(total_entradas_qtd, 3))
+            ck3.metric("Total saídas", formatar_numero_br(total_saidas_qtd, 3))
+            ck4.metric("Saldo final", formatar_numero_br(saldo_final_qtd, 3))
 
-        ck5, ck6 = st.columns(2)
-        ck5.metric("Custo médio atual", f"R$ {formatar_numero_br(custo_medio_atual, 4)}")
-        ck6.metric("Saldo final (valor)", f"R$ {formatar_numero_br(saldo_final_valor, 2)}")
+            ck5, ck6 = st.columns(2)
+            ck5.metric("Custo médio atual", f"R$ {formatar_numero_br(custo_medio_atual, 4)}")
+            ck6.metric("Saldo final (valor)", f"R$ {formatar_numero_br(saldo_final_valor, 2)}")
+        else:
+            st.subheader(f"Armazém {st.session_state.get('armazem_kardex_atual', '')} — todos os produtos")
+            ck1, ck2 = st.columns(2)
+            ck1.metric("Produtos encontrados", len(produtos_encontrados))
+            ck2.metric("Total de movimentos", len(df_k))
+            st.caption(
+                "Sem um produto específico selecionado, o saldo e o custo médio são calculados "
+                "separadamente para cada produto (as métricas agregadas de saldo não fariam sentido "
+                "somando produtos diferentes) — veja a coluna SALDO_QTD/CUSTO_MEDIO de cada linha na "
+                "tabela abaixo, agrupada por produto."
+            )
 
         st.caption(
             "⚠️ Saldo inicial considerado como 0 (a consulta traz todo o histórico disponível em "
@@ -2977,7 +3038,8 @@ with aba_kardex:
             "momento) — podem existir pequenas diferenças de arredondamento em relação à tela nativa, "
             "e ajustes de inventário/transferência (fora de SD1/SD2) não entram nesse cálculo. Quando "
             "há mais de um movimento na mesma data, a ordem entre eles é aproximada (o Protheus não "
-            "guarda o horário exato nesses campos)."
+            "guarda o horário exato nesses campos). Sem produto selecionado, a consulta pode trazer "
+            "muitos movimentos e demorar mais."
         )
 
         st.divider()
@@ -2991,10 +3053,12 @@ with aba_kardex:
         ].round(2)
         df_k_exib = df_k_exib[
             [
-                "DATA_MOV", "TIPO_MOV", "TES", "CFO", "DOCUMENTO", "ITEM", "QUANTIDADE",
+                "PRODUTO", "DESCRICAO", "DATA_MOV", "TIPO_MOV", "TES", "CFO", "DOCUMENTO", "ITEM", "QUANTIDADE",
                 "CUSTO_UNITARIO", "CUSTO_TOTAL_MOV", "SALDO_QTD", "CUSTO_MEDIO", "SALDO_VALOR",
             ]
         ]
+        if um_produto_so:
+            df_k_exib = df_k_exib.drop(columns=["PRODUTO", "DESCRICAO"])
 
         def _destacar_kardex(row):
             cor = ""
@@ -3008,13 +3072,11 @@ with aba_kardex:
         st.dataframe(estilo_kardex, use_container_width=True, hide_index=True, height=480)
 
         excel_kardex = gerar_excel(df_k_exib)
+        _produto_arquivo = st.session_state.get("produto_kardex_atual", "") or "todos"
         st.download_button(
             label="⬇️ Baixar Excel",
             data=excel_kardex,
-            file_name=(
-                f"kardex_{st.session_state.get('produto_kardex_atual', '')}_"
-                f"{armazem_codigo or ''}_{date.today().isoformat()}.xlsx"
-            ),
+            file_name=f"kardex_{_produto_arquivo}_{armazem_codigo or ''}_{date.today().isoformat()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_kardex",
         )
