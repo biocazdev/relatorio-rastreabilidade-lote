@@ -2671,7 +2671,10 @@ with aba_estoque:
         df_e_exib = df_e.copy()
         df_e_exib["VALIDADE"] = df_e_exib["VALIDADE"].apply(_formatar_valor_data)
         df_e_exib = df_e_exib[
-            ["LOTE", "LOCAL", "ARMAZEM_DESCRICAO", "SALDO_ATUAL", "VALIDADE", "STATUS_VALIDADE"]
+            [
+                "PRODUTO", "DESCRICAO", "LOTE", "LOCAL", "ARMAZEM_DESCRICAO",
+                "SALDO_ATUAL", "VALIDADE", "STATUS_VALIDADE",
+            ]
         ].sort_values("SALDO_ATUAL", ascending=False)
 
         def _destacar_validade_estoque(row):
