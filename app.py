@@ -794,6 +794,69 @@ def status_validade(validade) -> str:
 
 
 # --------------------------------------------------------------------------
+# Consulta: Saldo em estoque por lote, de um produto especifico (SB8)
+# --------------------------------------------------------------------------
+# Usada na aba "Saldo em Estoque". Diferente da SALDO_LOTE_QUERY acima (que
+# traz TODOS os produtos da filial, usada internamente pelas abas
+# Consolidado e Busca por Lote), essa aqui filtra por um produto especifico
+# (:produto, obrigatorio) e ja traz descricao do produto e do armazem, so
+# com lotes que ainda tem saldo (B8_SALDO > 0) - exatamente o cenario de
+# "quanto tem em estoque, de cada lote, do produto X".
+SALDO_ESTOQUE_QUERY = """
+SELECT
+    B8.B8_PRODUTO                              AS PRODUTO,
+    RTRIM(PROD.B1_DESC)                        AS DESCRICAO,
+    NULLIF(LTRIM(RTRIM(B8.B8_LOTECTL)), '')    AS LOTE,
+    RTRIM(B8.B8_LOCAL)                         AS LOCAL,
+    RTRIM(ARM.NNR_DESCRI)                      AS ARMAZEM_DESCRICAO,
+    B8.B8_SALDO                                AS SALDO_ATUAL,
+    B8.B8_DTVALID                              AS VALIDADE
+
+FROM SB8010 B8
+
+LEFT JOIN SB1010 PROD
+       ON PROD.B1_FILIAL = LEFT(B8.B8_FILIAL, 4)
+      AND PROD.B1_COD    = B8.B8_PRODUTO
+      AND PROD.D_E_L_E_T_ = ' '
+
+-- Descrição do armazém (cadastro NNR010) - mesmo padrão "filial mais
+-- específica primeiro" usado nas outras abas (ex: Busca por Lote).
+OUTER APPLY
+(
+    SELECT TOP 1 NNR.NNR_DESCRI
+    FROM NNR010 NNR
+    WHERE NNR.D_E_L_E_T_ = ' ' AND NNR.NNR_CODIGO = B8.B8_LOCAL
+    ORDER BY
+        CASE
+            WHEN NNR.NNR_FILIAL = LEFT(B8.B8_FILIAL, 4) THEN 1
+            WHEN NNR.NNR_FILIAL = '' THEN 2
+            ELSE 3
+        END
+) ARM
+
+WHERE B8.D_E_L_E_T_ = ' '
+  AND B8.B8_FILIAL = :filial
+  AND B8.B8_PRODUTO = :produto
+  AND NULLIF(LTRIM(RTRIM(B8.B8_LOTECTL)), '') IS NOT NULL
+  AND B8.B8_SALDO > 0
+
+ORDER BY B8.B8_LOTECTL, B8.B8_LOCAL
+"""
+
+
+@st.cache_data(ttl=300, show_spinner="Consultando saldo em estoque...")
+def carregar_saldo_estoque(_engine: Engine, filial: str, produto: str) -> tuple[pd.DataFrame, datetime]:
+    """Devolve (DataFrame, horário da consulta) - ver docstring de
+    carregar_dados() para o porquê do datetime.now() ficar dentro da
+    função cacheada."""
+    with _engine.connect() as conn:
+        df = pd.read_sql(
+            text(SALDO_ESTOQUE_QUERY), conn, params={"filial": filial, "produto": produto.strip()}
+        )
+    return df, datetime.now()
+
+
+# --------------------------------------------------------------------------
 # Consulta: Busca reversa por lote (de onde veio / para onde foi)
 # --------------------------------------------------------------------------
 # Usada na aba 3 (Busca por Lote). Recebe um numero de lote especifico
@@ -1731,10 +1794,10 @@ except Exception as e:
     st.error(f"Erro ao conectar no banco de dados: {e}")
     st.stop()
 
-aba_relatorio, aba_consolidado, aba_busca, aba_terceiros, aba_atraso = st.tabs(
+aba_relatorio, aba_consolidado, aba_busca, aba_terceiros, aba_atraso, aba_estoque = st.tabs(
     [
         "📊 Relatório de Movimentos", "📦 Consolidado por Lote", "🔍 Busca por Lote",
-        "🔄 Controle de Terceiros", "⏳ Atraso de Terceiros",
+        "🔄 Controle de Terceiros", "⏳ Atraso de Terceiros", "🏷️ Saldo em Estoque",
     ]
 )
 
@@ -2534,3 +2597,103 @@ with aba_atraso:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="download_atraso_terceiros",
             )
+
+# ==========================================================================
+# ABA 6 - Saldo em Estoque (por lote, de um produto especifico - SB8)
+# ==========================================================================
+# Reaproveita a mesma SB8010 usada na aba Consolidado, mas filtrada por um
+# produto especifico (obrigatorio) e so com lotes que ainda tem saldo - o
+# cenario de uso e "quanto tenho em estoque do produto X, separado por
+# lote", diferente do Consolidado (que mostra todos os produtos juntos,
+# somando comprado/vendido) e da Busca por Lote (que parte de um numero de
+# lote, nao de um produto).
+with aba_estoque:
+    st.caption(
+        "Saldo atual em estoque (SB8), por lote, de um produto específico — "
+        "mostra só os lotes que ainda têm saldo (maior que zero)."
+    )
+
+    col_e1, col_e2 = st.columns([3, 1])
+    produto_estoque = seletor_produto(
+        engine, "estoque", container=col_e1, label_codigo="Produto (código exato)"
+    )
+    col_e2.markdown("<br>", unsafe_allow_html=True)
+    consultar_estoque = col_e2.button("Consultar", type="primary", key="btn_estoque")
+
+    if consultar_estoque:
+        if not produto_estoque.strip():
+            st.warning("Informe o código do produto para consultar.")
+        else:
+            try:
+                st.session_state["df_estoque"], st.session_state["df_estoque_timestamp"] = carregar_saldo_estoque(
+                    engine, filial, produto_estoque
+                )
+                st.session_state["produto_estoque_atual"] = produto_estoque.strip()
+            except Exception as e:
+                st.error(f"Erro ao consultar o saldo em estoque: {e}")
+                st.session_state.pop("df_estoque", None)
+                st.session_state.pop("df_estoque_timestamp", None)
+
+    df_estoque = st.session_state.get("df_estoque")
+
+    if df_estoque is None:
+        st.info("Informe o código do produto e clique em 'Consultar'.")
+    elif df_estoque.empty:
+        st.info(
+            "Nenhum lote com saldo em estoque para o produto "
+            f"'{st.session_state.get('produto_estoque_atual', '')}'."
+        )
+    else:
+        _ts_e = st.session_state.get("df_estoque_timestamp")
+        if _ts_e:
+            st.caption(
+                f"🕒 Dados de {_ts_e.strftime('%d/%m/%Y %H:%M')} "
+                "(cache de 5 min — clique em 'Consultar' para atualizar)"
+            )
+
+        df_e = df_estoque.copy()
+        df_e["STATUS_VALIDADE"] = df_e["VALIDADE"].apply(status_validade)
+
+        produto_desc = df_e["DESCRICAO"].iloc[0] if not df_e.empty else ""
+        st.subheader(f"{st.session_state.get('produto_estoque_atual', '')} — {produto_desc}")
+
+        ce1, ce2, ce3 = st.columns(3)
+        ce1.metric("Total em estoque", formatar_numero_br(df_e["SALDO_ATUAL"].sum()))
+        ce2.metric("Lotes com saldo", len(df_e))
+        ce3.metric("🔴 Vencidos", int((df_e["STATUS_VALIDADE"] == "VENCIDO").sum()))
+        st.caption(
+            "Se o mesmo lote estiver guardado em mais de um armazém, aparece uma linha para cada um "
+            "(some as linhas do mesmo LOTE para o total consolidado dele)."
+        )
+
+        st.divider()
+
+        df_e_exib = df_e.copy()
+        df_e_exib["VALIDADE"] = df_e_exib["VALIDADE"].apply(_formatar_valor_data)
+        df_e_exib = df_e_exib[
+            ["LOTE", "LOCAL", "ARMAZEM_DESCRICAO", "SALDO_ATUAL", "VALIDADE", "STATUS_VALIDADE"]
+        ].sort_values("SALDO_ATUAL", ascending=False)
+
+        def _destacar_validade_estoque(row):
+            cor = ""
+            status_v = row.get("STATUS_VALIDADE", "")
+            if status_v == "VENCIDO":
+                cor = "background-color: #ffe1e1"
+            elif status_v == "VENCE EM ATE 30 DIAS":
+                cor = "background-color: #fff3cd"
+            return [cor] * len(row)
+
+        estilo_estoque = df_e_exib.style.apply(_destacar_validade_estoque, axis=1)
+        st.dataframe(estilo_estoque, use_container_width=True, hide_index=True, height=420)
+
+        excel_estoque = gerar_excel(df_e_exib)
+        st.download_button(
+            label="⬇️ Baixar Excel",
+            data=excel_estoque,
+            file_name=(
+                f"saldo_estoque_{st.session_state.get('produto_estoque_atual', '')}_"
+                f"{date.today().isoformat()}.xlsx"
+            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_saldo_estoque",
+        )
