@@ -857,6 +857,182 @@ def carregar_saldo_estoque(_engine: Engine, filial: str, produto: str) -> tuple[
 
 
 # --------------------------------------------------------------------------
+# Consulta: lista de armazens (NNR010), para o seletor da aba Kardex
+# --------------------------------------------------------------------------
+# So usada para preencher o selectbox de armazem - por isso pega so
+# CODIGO/DESCRICAO, 1 linha por armazem (o ROW_NUMBER() resolve o caso de
+# existir cadastro generico, filial='', E cadastro especifico da filial
+# atual para o mesmo codigo - fica so a versao mais especifica).
+ARMAZENS_QUERY = """
+SELECT CODIGO, DESCRICAO
+FROM (
+    SELECT
+        NNR.NNR_CODIGO                     AS CODIGO,
+        RTRIM(NNR.NNR_DESCRI)               AS DESCRICAO,
+        ROW_NUMBER() OVER (
+            PARTITION BY NNR.NNR_CODIGO
+            ORDER BY
+                CASE
+                    WHEN NNR.NNR_FILIAL = :filial THEN 1
+                    WHEN NNR.NNR_FILIAL = ''      THEN 2
+                    ELSE 3
+                END
+        ) AS RN
+    FROM NNR010 NNR
+    WHERE NNR.D_E_L_E_T_ = ' '
+) X
+WHERE X.RN = 1
+ORDER BY X.CODIGO
+"""
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def carregar_armazens(_engine: Engine, filial: str) -> pd.DataFrame:
+    """Lista de armazens (codigo + descricao) para o seletor da aba Kardex."""
+    with _engine.connect() as conn:
+        return pd.read_sql(text(ARMAZENS_QUERY), conn, params={"filial": filial})
+
+
+# --------------------------------------------------------------------------
+# Consulta: Kardex (historico cronologico de entradas/saidas de um produto,
+# num armazem especifico) - SD1010 (entradas) + SD2010 (saidas)
+# --------------------------------------------------------------------------
+# Usada na aba "Kardex". Diferente das outras consultas de movimento (que
+# trazem tambem dados de parceiro/pedido/rastreabilidade), essa aqui e
+# enxuta de proposito: so o que entra no calculo do saldo corrente e do
+# custo medio (TES, CFO, documento, quantidade e - so nas entradas - o
+# custo total da entrada, campo D1_CUSTO).
+#
+# NAO existe um campo unico e confiavel de custo por movimento na saida
+# (SD2010 tem D2_CUSTO1..D2_CUSTO5, varios "slots" de metodo de custeio, e
+# no exemplo que conferimos via listar_colunas.py todos vieram zerados -
+# alem disso era um registro cancelado, D_E_L_E_T_='*"). Por isso o custo
+# de cada saida e da media corrente NAO vem do banco: e calculado aqui no
+# app (ver calcular_kardex() mais abaixo), da mesma forma que o proprio
+# Protheus calcula custo medio ponderado movel - a cada entrada, soma
+# D1_CUSTO (que already vem liquido de ICMS/impostos recuperaveis) ao saldo
+# em valor e recalcula a media; a cada saida, valoriza pela media vigente
+# no momento e desconta do saldo.
+KARDEX_QUERY = """
+WITH MOVIMENTOS_KARDEX AS (
+    SELECT
+        'ENTRADA'                  AS TIPO_MOV,
+        D1.D1_EMISSAO              AS DATA_MOV,
+        RTRIM(D1.D1_TES)           AS TES,
+        RTRIM(D1.D1_CF)            AS CFO,
+        RTRIM(D1.D1_DOC)           AS DOC,
+        RTRIM(D1.D1_SERIE)         AS SERIE,
+        RTRIM(D1.D1_ITEM)          AS ITEM,
+        D1.D1_QUANT                AS QUANTIDADE,
+        D1.D1_CUSTO                AS CUSTO_TOTAL_ENTRADA,
+        D1.R_E_C_N_O_              AS RECNO
+
+    FROM SD1010 D1
+
+    WHERE D1.D_E_L_E_T_ = ' '
+      AND D1.D1_FILIAL = :filial
+      AND D1.D1_COD    = :produto
+      AND D1.D1_LOCAL  = :local
+
+    UNION ALL
+
+    SELECT
+        'SAIDA'                    AS TIPO_MOV,
+        D2.D2_EMISSAO              AS DATA_MOV,
+        RTRIM(D2.D2_TES)           AS TES,
+        RTRIM(D2.D2_CF)            AS CFO,
+        RTRIM(D2.D2_DOC)           AS DOC,
+        RTRIM(D2.D2_SERIE)         AS SERIE,
+        RTRIM(D2.D2_ITEM)          AS ITEM,
+        D2.D2_QUANT                AS QUANTIDADE,
+        NULL                       AS CUSTO_TOTAL_ENTRADA,
+        D2.R_E_C_N_O_              AS RECNO
+
+    FROM SD2010 D2
+
+    WHERE D2.D_E_L_E_T_ = ' '
+      AND D2.D2_FILIAL = :filial
+      AND D2.D2_COD    = :produto
+      AND D2.D2_LOCAL  = :local
+)
+SELECT TIPO_MOV, DATA_MOV, TES, CFO, DOC, SERIE, ITEM, QUANTIDADE, CUSTO_TOTAL_ENTRADA, RECNO
+FROM MOVIMENTOS_KARDEX
+ORDER BY DATA_MOV, DOC, SERIE, ITEM
+"""
+
+
+@st.cache_data(ttl=300, show_spinner="Consultando movimentos do Kardex...")
+def carregar_kardex_bruto(_engine: Engine, filial: str, produto: str, local: str) -> tuple[pd.DataFrame, datetime]:
+    """Devolve (DataFrame, horário da consulta) so com os movimentos brutos
+    (sem saldo/custo calculado ainda - isso e feito por calcular_kardex(),
+    fora do cache, porque e so processamento em memoria e nao precisa
+    bater no banco de novo)."""
+    with _engine.connect() as conn:
+        df = pd.read_sql(
+            text(KARDEX_QUERY),
+            conn,
+            params={"filial": filial, "produto": produto.strip(), "local": local.strip()},
+        )
+    return df, datetime.now()
+
+
+def calcular_kardex(df_bruto: pd.DataFrame) -> pd.DataFrame:
+    """Recebe os movimentos brutos (ja ordenados por DATA_MOV/DOC/SERIE/ITEM)
+    e calcula, linha a linha, o custo do movimento e o saldo corrente
+    (quantidade e valor), pelo metodo de custo medio ponderado movel -
+    mesma logica que o Protheus usa internamente:
+
+    - ENTRADA: soma a quantidade e o custo total (D1_CUSTO) ao saldo;
+      o "custo unitario" dessa entrada e custo_total / quantidade.
+    - SAIDA: valoriza a quantidade que sai pela media vigente NESSE
+      momento (saldo_valor / saldo_qtd), e desconta quantidade e valor
+      do saldo.
+
+    Saldo inicial e sempre 0 - a consulta traz o historico completo (sem
+    filtro de periodo), entao nao ha saldo "anterior" a considerar.
+    """
+    df = df_bruto.copy()
+    saldo_qtd = 0.0
+    saldo_valor = 0.0
+
+    custo_unitario_lista = []
+    custo_total_mov_lista = []
+    saldo_qtd_lista = []
+    saldo_valor_lista = []
+    custo_medio_lista = []
+
+    for _, linha in df.iterrows():
+        qtd = float(linha["QUANTIDADE"] or 0)
+
+        if linha["TIPO_MOV"] == "ENTRADA":
+            custo_total_mov = float(linha["CUSTO_TOTAL_ENTRADA"] or 0)
+            custo_unitario = (custo_total_mov / qtd) if qtd else 0.0
+            saldo_qtd += qtd
+            saldo_valor += custo_total_mov
+        else:  # SAIDA
+            custo_medio_vigente = (saldo_valor / saldo_qtd) if saldo_qtd else 0.0
+            custo_unitario = custo_medio_vigente
+            custo_total_mov = qtd * custo_medio_vigente
+            saldo_qtd -= qtd
+            saldo_valor -= custo_total_mov
+
+        custo_medio_pos = (saldo_valor / saldo_qtd) if saldo_qtd else 0.0
+
+        custo_unitario_lista.append(custo_unitario)
+        custo_total_mov_lista.append(custo_total_mov)
+        saldo_qtd_lista.append(saldo_qtd)
+        saldo_valor_lista.append(saldo_valor)
+        custo_medio_lista.append(custo_medio_pos)
+
+    df["CUSTO_UNITARIO"] = custo_unitario_lista
+    df["CUSTO_TOTAL_MOV"] = custo_total_mov_lista
+    df["SALDO_QTD"] = saldo_qtd_lista
+    df["SALDO_VALOR"] = saldo_valor_lista
+    df["CUSTO_MEDIO"] = custo_medio_lista
+    return df
+
+
+# --------------------------------------------------------------------------
 # Consulta: Busca reversa por lote (de onde veio / para onde foi)
 # --------------------------------------------------------------------------
 # Usada na aba 3 (Busca por Lote). Recebe um numero de lote especifico
@@ -1794,10 +1970,10 @@ except Exception as e:
     st.error(f"Erro ao conectar no banco de dados: {e}")
     st.stop()
 
-aba_relatorio, aba_consolidado, aba_busca, aba_terceiros, aba_atraso, aba_estoque = st.tabs(
+aba_relatorio, aba_consolidado, aba_busca, aba_terceiros, aba_atraso, aba_estoque, aba_kardex = st.tabs(
     [
         "📊 Relatório de Movimentos", "📦 Consolidado por Lote", "🔍 Busca por Lote",
-        "🔄 Controle de Terceiros", "⏳ Atraso de Terceiros", "🏷️ Saldo em Estoque",
+        "🔄 Controle de Terceiros", "⏳ Atraso de Terceiros", "🏷️ Saldo em Estoque", "📒 Kardex",
     ]
 )
 
@@ -2699,4 +2875,146 @@ with aba_estoque:
             ),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_saldo_estoque",
+        )
+
+# ==========================================================================
+# ABA 7 - Kardex (historico cronologico + saldo/custo corrente - SD1/SD2)
+# ==========================================================================
+# Mesma ideia da tela nativa "Consulta ao Kardex" do Protheus: produto +
+# armazem especificos, movimentos em ordem cronologica e saldo corrente
+# (quantidade, custo medio e valor) apos cada movimento. Ver o comentario
+# em cima de KARDEX_QUERY/calcular_kardex() para como o custo e calculado
+# (custo medio ponderado movel, calculado aqui no app - nao vem pronto do
+# banco).
+with aba_kardex:
+    st.caption(
+        "Histórico cronológico de entradas e saídas de um produto, num armazém específico, com saldo e "
+        "custo médio correntes após cada movimento — no mesmo espírito da tela nativa de Kardex."
+    )
+
+    col_k1, col_k2, col_k3 = st.columns([3, 2, 1])
+    produto_kardex = seletor_produto(
+        engine, "kardex", container=col_k1, label_codigo="Produto (código exato)"
+    )
+
+    try:
+        df_armazens = carregar_armazens(engine, filial)
+    except Exception as e:
+        st.warning(f"Não foi possível carregar a lista de armazéns agora: {e}")
+        df_armazens = pd.DataFrame(columns=["CODIGO", "DESCRICAO"])
+
+    opcoes_armazem = ["(selecione o armazém)"] + [
+        f"{linha.CODIGO} - {linha.DESCRICAO}" for linha in df_armazens.itertuples()
+    ]
+    armazem_escolha = col_k2.selectbox("Armazém", opcoes_armazem, key="kardex_armazem")
+    armazem_codigo = armazem_escolha.split(" - ", 1)[0] if armazem_escolha != "(selecione o armazém)" else ""
+
+    col_k3.markdown("<br>", unsafe_allow_html=True)
+    consultar_kardex = col_k3.button("Consultar", type="primary", key="btn_kardex")
+
+    if consultar_kardex:
+        if not produto_kardex.strip():
+            st.warning("Informe o código do produto para consultar.")
+        elif not armazem_codigo:
+            st.warning("Selecione o armazém para consultar.")
+        else:
+            try:
+                st.session_state["df_kardex"], st.session_state["df_kardex_timestamp"] = carregar_kardex_bruto(
+                    engine, filial, produto_kardex, armazem_codigo
+                )
+                st.session_state["produto_kardex_atual"] = produto_kardex.strip()
+                st.session_state["armazem_kardex_atual"] = armazem_escolha
+            except Exception as e:
+                st.error(f"Erro ao consultar o Kardex: {e}")
+                st.session_state.pop("df_kardex", None)
+                st.session_state.pop("df_kardex_timestamp", None)
+
+    df_kardex_bruto = st.session_state.get("df_kardex")
+
+    if df_kardex_bruto is None:
+        st.info("Informe o produto e o armazém e clique em 'Consultar'.")
+    elif df_kardex_bruto.empty:
+        st.info(
+            "Nenhuma entrada ou saída encontrada para o produto "
+            f"'{st.session_state.get('produto_kardex_atual', '')}' no armazém "
+            f"'{st.session_state.get('armazem_kardex_atual', '')}'."
+        )
+    else:
+        _ts_k = st.session_state.get("df_kardex_timestamp")
+        if _ts_k:
+            st.caption(
+                f"🕒 Dados de {_ts_k.strftime('%d/%m/%Y %H:%M')} "
+                "(cache de 5 min — clique em 'Consultar' para atualizar)"
+            )
+
+        df_k = calcular_kardex(df_kardex_bruto)
+
+        st.subheader(
+            f"{st.session_state.get('produto_kardex_atual', '')} — "
+            f"Armazém {st.session_state.get('armazem_kardex_atual', '')}"
+        )
+
+        total_entradas_qtd = df_k.loc[df_k["TIPO_MOV"] == "ENTRADA", "QUANTIDADE"].sum()
+        total_saidas_qtd = df_k.loc[df_k["TIPO_MOV"] == "SAIDA", "QUANTIDADE"].sum()
+        saldo_final_qtd = df_k["SALDO_QTD"].iloc[-1]
+        saldo_final_valor = df_k["SALDO_VALOR"].iloc[-1]
+        custo_medio_atual = df_k["CUSTO_MEDIO"].iloc[-1]
+
+        ck1, ck2, ck3, ck4 = st.columns(4)
+        ck1.metric("Saldo inicial", "0,00")
+        ck2.metric("Total entradas", formatar_numero_br(total_entradas_qtd, 3))
+        ck3.metric("Total saídas", formatar_numero_br(total_saidas_qtd, 3))
+        ck4.metric("Saldo final", formatar_numero_br(saldo_final_qtd, 3))
+
+        ck5, ck6 = st.columns(2)
+        ck5.metric("Custo médio atual", f"R$ {formatar_numero_br(custo_medio_atual, 4)}")
+        ck6.metric("Saldo final (valor)", f"R$ {formatar_numero_br(saldo_final_valor, 2)}")
+
+        st.caption(
+            "⚠️ Saldo inicial considerado como 0 (a consulta traz todo o histórico disponível em "
+            "SD1/SD2, sem filtro de período). O custo médio e o saldo em valor são calculados aqui no "
+            "app pelo método de custo médio ponderado móvel (a saída valoriza pela média vigente no "
+            "momento) — podem existir pequenas diferenças de arredondamento em relação à tela nativa, "
+            "e ajustes de inventário/transferência (fora de SD1/SD2) não entram nesse cálculo. Quando "
+            "há mais de um movimento na mesma data, a ordem entre eles é aproximada (o Protheus não "
+            "guarda o horário exato nesses campos)."
+        )
+
+        st.divider()
+
+        df_k_exib = df_k.copy()
+        df_k_exib["DATA_MOV"] = df_k_exib["DATA_MOV"].apply(_formatar_valor_data)
+        df_k_exib["DOCUMENTO"] = df_k_exib["DOC"].astype(str).str.strip() + "-" + df_k_exib["SERIE"].astype(str).str.strip()
+        df_k_exib[["QUANTIDADE", "SALDO_QTD"]] = df_k_exib[["QUANTIDADE", "SALDO_QTD"]].round(3)
+        df_k_exib[["CUSTO_UNITARIO", "CUSTO_TOTAL_MOV", "SALDO_VALOR", "CUSTO_MEDIO"]] = df_k_exib[
+            ["CUSTO_UNITARIO", "CUSTO_TOTAL_MOV", "SALDO_VALOR", "CUSTO_MEDIO"]
+        ].round(2)
+        df_k_exib = df_k_exib[
+            [
+                "DATA_MOV", "TIPO_MOV", "TES", "CFO", "DOCUMENTO", "ITEM", "QUANTIDADE",
+                "CUSTO_UNITARIO", "CUSTO_TOTAL_MOV", "SALDO_QTD", "CUSTO_MEDIO", "SALDO_VALOR",
+            ]
+        ]
+
+        def _destacar_kardex(row):
+            cor = ""
+            if row.get("TIPO_MOV") == "ENTRADA":
+                cor = "background-color: #e6f4ea"
+            elif row.get("TIPO_MOV") == "SAIDA":
+                cor = "background-color: #fdeaea"
+            return [cor] * len(row)
+
+        estilo_kardex = df_k_exib.style.apply(_destacar_kardex, axis=1)
+        st.dataframe(estilo_kardex, use_container_width=True, hide_index=True, height=480)
+
+        excel_kardex = gerar_excel(df_k_exib)
+        st.download_button(
+            label="⬇️ Baixar Excel",
+            data=excel_kardex,
+            file_name=(
+                f"kardex_{st.session_state.get('produto_kardex_atual', '')}_"
+                f"{armazem_codigo or ''}_{date.today().isoformat()}.xlsx"
+            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_kardex",
         )
